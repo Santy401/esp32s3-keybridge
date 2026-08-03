@@ -10,7 +10,7 @@ Convierte tu **teclado de laptop** en un **teclado USB externo** para otra compu
 
 - **Firmware** (`firmware/`): el ESP32-S3 se presenta como teclado USB HID por su puerto USB nativo (TinyUSB). Lee eventos por UART y los emite como teclas HID.
 - **Laptop** (`laptop/`): captura las teclas físicas con `evdev`, las traduce a códigos USB HID y las envía por serial al ESP32.
-- **Toggle por atajo**: presiona `Ctrl+Alt+B` para encender (el teclado va solo al desktop) y apagar (vuelve a ser teclado normal de la laptop).
+- **Toggle por atajo**: presiona `F9+F10` para encender (el teclado y el ratón van solo al desktop) y apagar (vuelven a ser normales de la laptop). Se usa `F9+F10` y no Ctrl/Alt para que las combinaciones con Ctrl/Alt y la tecla `B` sigan funcionando en el desktop (cámbialo con `--toggle`).
 
 ## Conexión
 

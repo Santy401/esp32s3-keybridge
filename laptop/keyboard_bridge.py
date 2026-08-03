@@ -124,8 +124,8 @@ class KeyboardBridge:
         self.serial_port = serial_port
         self.baudrate = baudrate
         self.grab = grab
-        self.toggle_codes = toggle_codes or [ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_B]
-        self.toggle_desc = toggle_desc or 'Ctrl+Alt+B'
+        self.toggle_codes = toggle_codes or [ecodes.KEY_F9, ecodes.KEY_F10]
+        self.toggle_desc = toggle_desc or 'F9+F10'
         self.mouse_path = mouse_path
         self.mouse_scale = mouse_scale
         self.device = None
@@ -482,8 +482,8 @@ def main():
                         help='Velocidad del puerto serial')
     parser.add_argument('--grab', action='store_true',
                         help='Iniciar ya encendido (solo va al desktop)')
-    parser.add_argument('--toggle', default='ctrl+alt+b',
-                        help='Combo para encender/apagar el puente (ej: ctrl+alt+b)')
+    parser.add_argument('--toggle', default='f9+f10',
+                        help='Combo para encender/apagar el puente (ej: f9+f10, evita ctrl/alt)')
     parser.add_argument('--list-devices', action='store_true',
                         help='Listar todos los dispositivos de entrada disponibles')
 
