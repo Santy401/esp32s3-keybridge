@@ -5,9 +5,13 @@
  * - UART (Serial): recibe comandos desde la laptop
  * - USB HID: actua como teclado para el desktop
  *
- * Protocolo: 2 bytes por evento
- * Byte 0: Tipo de evento (0x01=PRESS, 0x00=RELEASE)
- * Byte 1: Codigo HID crudo de la tecla (tabla USB HID)
+ * Protocolo (bytes de longitud variable segun el tipo):
+ *   Teclado (2 bytes):
+ *     [0x01=PRESS | 0x00=RELEASE] [codigo HID crudo]
+ *   Raton - mover (4 bytes):
+ *     [0x02] [dx] [dy] [rueda]        (dx, dy, rueda como int8 con signo)
+ *   Raton - botones (2 bytes):
+ *     [0x03=PRESS | 0x04=RELEASE] [boton HID]
  *
  * NOTA IMPORTANTE: se usan pressRaw()/releaseRaw() porque los codigos
  * que envia la laptop son USAGE CODES crudos (0x04=A, 0x28=ENTER, ...).
@@ -20,20 +24,26 @@
 
 #include "USB.h"
 #include "USBHIDKeyboard.h"
+#include "USBHIDMouse.h"
 
 // --- Configuracion -----------------------------------------------------
 #define SERIAL_BAUD     115200
-#define EVENT_PRESS     0x01
 #define EVENT_RELEASE   0x00
+#define EVENT_PRESS     0x01
+#define EVENT_MOUSE_MOVE    0x02
+#define EVENT_MOUSE_PRESS   0x03
+#define EVENT_MOUSE_RELEASE 0x04
 #define LED_PIN         2
 //#define DEBUG          // descomentar para ver traza en el Serial
 
-// Instancia del teclado USB HID
+// Instancias HID (teclado + raton) sobre el mismo puerto USB nativo
 USBHIDKeyboard Keyboard;
+USBHIDRelativeMouse Mouse;
 
-// Buffer para recibir los paquetes de 2 bytes
-uint8_t rxBuffer[2];
+// Buffer para recibir los paquetes (max 4 bytes) y estado del framing
+uint8_t rxBuffer[4];
 uint8_t bufferIndex = 0;
+uint8_t frameLen = 0;
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
@@ -42,13 +52,31 @@ void setup() {
   // Serial = UART0 (esta cableado al puente USB->UART de la placa)
   Serial.begin(SERIAL_BAUD);
 
-  // Inicializar el teclado USB HID y el USB nativo (TinyUSB)
+  // Inicializar teclado + raton USB HID y el USB nativo (TinyUSB)
   Keyboard.begin();
+  Mouse.begin();
   USB.begin();
 
-  Serial.println("ESP32-S3 Keyboard Bridge iniciado");
+  Serial.println("ESP32-S3 Keyboard+Mouse Bridge iniciado");
   Serial.println("Esperando comandos por UART...");
   digitalWrite(LED_PIN, HIGH);
+}
+
+/**
+ * Longitud total del frame segun el byte de tipo (0 si es invalido).
+ */
+uint8_t longitudEvento(uint8_t tipo) {
+  switch (tipo) {
+    case EVENT_RELEASE:        // tecla soltar
+    case EVENT_PRESS:          // tecla pulsar
+    case EVENT_MOUSE_PRESS:    // boton raton pulsar
+    case EVENT_MOUSE_RELEASE:  // boton raton soltar
+      return 2;
+    case EVENT_MOUSE_MOVE:     // mover raton (dx, dy, rueda)
+      return 4;
+    default:
+      return 0;
+  }
 }
 
 void loop() {
@@ -56,14 +84,26 @@ void loop() {
   while (Serial.available() > 0) {
     uint8_t byteLeido = Serial.read();
 
-    if (bufferIndex < 2) {
+    if (bufferIndex == 0) {
+      frameLen = longitudEvento(byteLeido);
+      if (frameLen == 0) {
+#ifdef DEBUG
+        Serial.print("ERROR: Tipo de evento invalido: 0x");
+        Serial.println(byteLeido, HEX);
+#endif
+        continue;
+      }
+      rxBuffer[0] = byteLeido;
+      bufferIndex = 1;
+    } else {
       rxBuffer[bufferIndex] = byteLeido;
       bufferIndex++;
+    }
 
-      if (bufferIndex == 2) {
-        procesarEvento(rxBuffer[0], rxBuffer[1]);
-        bufferIndex = 0;
-      }
+    if (bufferIndex == frameLen) {
+      procesarEvento(rxBuffer);
+      bufferIndex = 0;
+      frameLen = 0;
     }
   }
 
@@ -71,34 +111,38 @@ void loop() {
 }
 
 /**
- * Procesa un evento recibido por UART.
- * @param tipoEvento 0x01=press, 0x00=release
- * @param codigoHID  usage code USB HID crudo
+ * Procesa un frame completo recibido por UART.
+ * @param buffer  frame: [tipo, payload...]
  */
-void procesarEvento(uint8_t tipoEvento, uint8_t codigoHID) {
-  if (codigoHID == 0x00) {
+void procesarEvento(uint8_t *buffer) {
+  uint8_t tipo = buffer[0];
+
 #ifdef DEBUG
-    Serial.println("ERROR: Codigo HID invalido (0x00)");
-#endif
-    return;
+  Serial.print("Frame: 0x");
+  Serial.print(tipo, HEX);
+  for (uint8_t i = 1; i < frameLen; i++) {
+    Serial.print(" 0x");
+    Serial.print(buffer[i], HEX);
   }
-
-#ifdef DEBUG
-  Serial.print("Evento: ");
-  Serial.print(tipoEvento == EVENT_PRESS ? "PRESS" : "RELEASE");
-  Serial.print(" | HID: 0x");
-  Serial.println(codigoHID, HEX);
+  Serial.println();
 #endif
 
-  if (tipoEvento == EVENT_PRESS) {
-    Keyboard.pressRaw(codigoHID);
-  } else if (tipoEvento == EVENT_RELEASE) {
-    Keyboard.releaseRaw(codigoHID);
-  } else {
-#ifdef DEBUG
-    Serial.print("ERROR: Tipo de evento invalido: 0x");
-    Serial.println(tipoEvento, HEX);
-#endif
+  switch (tipo) {
+    case EVENT_PRESS:
+      if (buffer[1] != 0x00) Keyboard.pressRaw(buffer[1]);
+      break;
+    case EVENT_RELEASE:
+      if (buffer[1] != 0x00) Keyboard.releaseRaw(buffer[1]);
+      break;
+    case EVENT_MOUSE_MOVE:
+      Mouse.move((int8_t)buffer[1], (int8_t)buffer[2], (int8_t)buffer[3]);
+      break;
+    case EVENT_MOUSE_PRESS:
+      Mouse.press(buffer[1]);
+      break;
+    case EVENT_MOUSE_RELEASE:
+      Mouse.release(buffer[1]);
+      break;
   }
 }
 

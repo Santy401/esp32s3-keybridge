@@ -2,15 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Keyboard Bridge - Capturador y Traductor para Laptop
+Keyboard/Mouse Bridge - Capturador y Traductor para Laptop
 
 Este script:
 1. Captura eventos del teclado fisico (ej: /dev/input/event3)
-2. Traduce keycodes de Linux a USB HID
-3. Envia los eventos traducidos por UART al ESP32-S3
+2. Captura eventos del raton (ej: /dev/input/event4)
+3. Traduce keycodes de Linux a USB HID
+4. Envia los eventos traducidos por UART al ESP32-S3
 """
 
 import glob
+import select
 import argparse
 import serial
 from evdev import InputDevice, ecodes
@@ -100,22 +102,43 @@ KEYMAP_LINUX_TO_HID = {
     ecodes.KEY_KPDOT: 0x63,
 }
 
+# Mapeo de botones de raton de Linux (BTN_*) a usage codes USB HID
+MOUSE_BUTTON_MAP = {
+    ecodes.BTN_LEFT: 0x01,
+    ecodes.BTN_RIGHT: 0x02,
+    ecodes.BTN_MIDDLE: 0x04,
+    ecodes.BTN_SIDE: 0x08,    # boton de retroceso (barra lateral)
+    ecodes.BTN_EXTRA: 0x10,   # boton de avance (barra lateral)
+}
+
+
+def _clamp(valor, minimo, maximo):
+    return max(minimo, min(maximo, valor))
+
 
 class KeyboardBridge:
     def __init__(self, device_path='/dev/input/event3', serial_port='/dev/ttyACM0',
-                 baudrate=115200, grab=False, toggle_codes=None, toggle_desc=''):
+                 baudrate=115200, grab=False, toggle_codes=None, toggle_desc='',
+                 mouse_path=None, mouse_scale=1.0):
         self.device_path = device_path
         self.serial_port = serial_port
         self.baudrate = baudrate
         self.grab = grab
         self.toggle_codes = toggle_codes or [ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTALT, ecodes.KEY_B]
         self.toggle_desc = toggle_desc or 'Ctrl+Alt+B'
+        self.mouse_path = mouse_path
+        self.mouse_scale = mouse_scale
         self.device = None
+        self.mouse_dev = None
         self.ser = None
         self.running = False
         self.forwarding = False
         self.pressed = set()
         self.combo_completo = False
+        self._dx = 0
+        self._dy = 0
+        self._wheel = 0
+        self._pan = 0
 
     def connect(self):
         try:
@@ -138,6 +161,11 @@ class KeyboardBridge:
                 bytesize=serial.EIGHTBITS,
             )
             print(f"Conectado al puerto serial: {self.serial_port} @ {self.baudrate} baudios")
+
+            if self.mouse_path:
+                self.mouse_dev = InputDevice(self.mouse_path)
+                print(f"Conectado al raton: {self.mouse_dev.name}")
+                print(f"  Ruta: {self.mouse_path}")
             return True
 
         except FileNotFoundError:
@@ -156,12 +184,15 @@ class KeyboardBridge:
     def disconnect(self):
         if self.ser:
             self.ser.close()
-        if self.device:
-            if self.forwarding:
+        for dev in (self.mouse_dev, self.device):
+            if dev and self.forwarding:
                 try:
-                    self.device.ungrab()
+                    dev.ungrab()
                 except Exception:
                     pass
+        if self.mouse_dev:
+            self.mouse_dev.close()
+        if self.device:
             self.device.close()
         print("Conexiones cerradas")
 
@@ -172,11 +203,10 @@ class KeyboardBridge:
             print(f"Aviso: tecla no mapeada: {key_name} (0x{keycode:02X})")
         return hid_code
 
-    def enviar_evento(self, tipo_evento, hid_code):
-        if hid_code is None or hid_code == 0:
-            return
+    def enviar_evento(self, *datos):
         try:
-            packet = bytes([tipo_evento, hid_code])
+            # Los deltas del raton son int8 con signo; convertirlos a bytes
+            packet = bytes(int(v) & 0xFF for v in datos)
             self.ser.write(packet)
             self.ser.flush()
         except serial.SerialTimeoutException:
@@ -192,19 +222,22 @@ class KeyboardBridge:
     def _cambiar_estado(self, encendido):
         self.forwarding = encendido
         if encendido:
-            try:
-                self.device.grab()
-                print(f"[PUENTE ENCENDIDO] teclado enviando al desktop (grab)")
-                print(f"  Presiona {self.toggle_desc} para apagar")
-            except Exception as e:
-                print(f"Aviso: no se pudo hacer grab: {e}")
+            for dev in (self.device, self.mouse_dev):
+                if dev:
+                    try:
+                        dev.grab()
+                    except Exception as e:
+                        print(f"Aviso: no se pudo hacer grab: {e}")
+            print(f"[PUENTE ENCENDIDO] teclado y raton enviando al desktop (grab)")
+            print(f"  Presiona {self.toggle_desc} para apagar")
         else:
-            if self.device:
-                try:
-                    self.device.ungrab()
-                except Exception:
-                    pass
-            print(f"[PUENTE APAGADO] teclado normal de la laptop")
+            for dev in (self.device, self.mouse_dev):
+                if dev:
+                    try:
+                        dev.ungrab()
+                    except Exception:
+                        pass
+            print(f"[PUENTE APAGADO] teclado y raton normales de la laptop")
             print(f"  Presiona {self.toggle_desc} para encender")
 
     def _procesar_tecla(self, event):
@@ -242,6 +275,43 @@ class KeyboardBridge:
         else:
             self.enviar_evento(0x00, hid_code)
 
+    def _procesar_mouse(self, event):
+        # Acumular deltas relativos hasta el reporte (SYN_REPORT)
+        if event.type == ecodes.EV_REL:
+            if event.code == ecodes.REL_X:
+                self._dx += int(round(event.value * self.mouse_scale))
+            elif event.code == ecodes.REL_Y:
+                self._dy += int(round(event.value * self.mouse_scale))
+            elif event.code == ecodes.REL_WHEEL:
+                self._wheel = _clamp(self._wheel + event.value, -127, 127)
+            elif event.code == ecodes.REL_HWHEEL:
+                self._pan = _clamp(self._pan + event.value, -127, 127)
+            return
+
+        if event.type == ecodes.EV_KEY:
+            btn = MOUSE_BUTTON_MAP.get(event.code)
+            if btn is None or not self.forwarding:
+                return
+            if event.value == 1:
+                self.enviar_evento(0x03, btn)
+            elif event.value == 0:
+                self.enviar_evento(0x04, btn)
+            return
+
+        if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
+            dx = _clamp(self._dx, -127, 127)
+            dy = _clamp(self._dy, -127, 127)
+            self._dx -= dx
+            self._dy -= dy
+            if not self.forwarding:
+                self._wheel = 0
+                self._pan = 0
+                return
+            if dx or dy or self._wheel or self._pan:
+                self.enviar_evento(0x02, dx, dy, self._wheel, self._pan)
+            self._wheel = 0
+            self._pan = 0
+
     def run(self):
         if not self.device or not self.ser:
             print("No hay conexiones activas")
@@ -253,29 +323,42 @@ class KeyboardBridge:
         if self.forwarding:
             self._cambiar_estado(True)
         else:
-            print(f"[PUENTE APAGADO] teclado normal de la laptop")
+            print(f"[PUENTE APAGADO] teclado y raton normales de la laptop")
             print(f"  Presiona {self.toggle_desc} para encender y usar el desktop")
 
-        print("Escuchando eventos del teclado...")
+        print("Escuchando eventos del teclado y el raton...")
+
+        # Mapear descriptores de fichero a sus dispositivos
+        fds = [self.device.fd]
+        fd_map = {self.device.fd: self.device}
+        if self.mouse_dev:
+            fds.append(self.mouse_dev.fd)
+            fd_map[self.mouse_dev.fd] = self.mouse_dev
 
         try:
-            for event in self.device.read_loop():
-                if not self.running:
-                    break
-                if event.type == ecodes.EV_KEY:
-                    self._procesar_tecla(event)
+            while self.running:
+                r, _, _ = select.select(fds, [], [], 0.5)
+                for fd in r:
+                    dev = fd_map[fd]
+                    for event in dev.read():
+                        if dev is self.mouse_dev:
+                            self._procesar_mouse(event)
+                        elif event.type == ecodes.EV_KEY:
+                            self._procesar_tecla(event)
         except KeyboardInterrupt:
             print("\nInterrupcion recibida")
         except Exception as e:
             print(f"Error en el bucle de eventos: {e}")
         finally:
             self.running = False
-            if self.forwarding and self.device:
-                try:
-                    self.device.ungrab()
-                    print("Teclado liberado")
-                except Exception:
-                    pass
+            if self.forwarding:
+                for dev in (self.mouse_dev, self.device):
+                    if dev:
+                        try:
+                            dev.ungrab()
+                            print("Dispositivo liberado")
+                        except Exception:
+                            pass
 
 
 def detectar_puerto_serial():
@@ -292,8 +375,8 @@ def detectar_puerto_serial():
 
 
 def detectar_teclado():
-    """Detecta el teclado fisico de la laptop (excluye ratones y HID del ESP32)."""
-    candidates = []
+    """Detecta el teclado fisico de la laptop (excluye ratones y combos inalambricos)."""
+    candidatos = []
     for path in sorted(glob.glob('/dev/input/event*')):
         try:
             dev = InputDevice(path)
@@ -301,18 +384,62 @@ def detectar_teclado():
             if ecodes.EV_KEY in caps:
                 has_letters = ecodes.KEY_A in caps[ecodes.EV_KEY]
                 has_enter = ecodes.KEY_ENTER in caps[ecodes.EV_KEY]
-                if has_letters and has_enter and not dev.name.lower().startswith('logitech'):
-                    candidates.append((path, dev.name))
+                if has_letters and has_enter:
+                    candidatos.append((path, dev.name))
         except Exception:
             pass
-    if len(candidates) == 1:
-        print(f"Teclado detectado: {candidates[0][0]} ({candidates[0][1]})")
-        return candidates[0][0]
-    elif len(candidates) > 1:
-        print("Varios teclados encontrados, usa --device para elegir:")
-        for path, name in candidates:
-            print(f"  {path}: {name}")
+
+    if not candidatos:
+        return None
+
+    # Preferir el teclado integrado de la laptop sobre interfaces inalambricas
+    def prioridad(item):
+        n = item[1].lower()
+        if 'wireless' in n or 'yichip' in n or 'logitech' in n:
+            return 1
+        if 'at translated' in n or 'keyboard' in n:
+            return 0
+        return 2
+
+    candidatos.sort(key=prioridad)
+    mejor = candidatos[0]
+
+    if len(candidatos) == 1 or prioridad(mejor) == 0:
+        print(f"Teclado detectado: {mejor[0]} ({mejor[1]})")
+        return mejor[0]
+
+    print("Varios teclados encontrados, usa --device para elegir:")
+    for path, name in candidatos:
+        print(f"  {path}: {name}")
     return None
+
+
+def detectar_raton():
+    """Detecta un raton USB relativo (excluye touchpad, trackpoint, etc.)."""
+    candidates = []
+    for path in sorted(glob.glob('/dev/input/event*')):
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities()
+            rel = set(caps.get(ecodes.EV_REL, []))
+            keys = set(caps.get(ecodes.EV_KEY, []))
+            if ecodes.REL_X in rel and ecodes.REL_Y in rel and ecodes.BTN_LEFT in keys:
+                name = dev.name.lower()
+                if any(x in name for x in ('touchpad', 'trackpoint', 'elantech',
+                                           'synaptics', 'thinkpad')):
+                    continue
+                candidates.append((path, dev.name))
+        except Exception:
+            pass
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        for path, name in candidates:
+            if 'logitech' in name.lower():
+                print(f"Raton detectado: {path} ({name})")
+                return path
+    print(f"Raton detectado: {candidates[0][0]} ({candidates[0][1]})")
+    return candidates[0][0]
 
 
 def parse_combo(texto):
@@ -338,10 +465,16 @@ def parse_combo(texto):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Puente USB HID: captura teclado y envia por UART al ESP32"
+        description="Puente USB HID: captura teclado y raton y los envia por UART al ESP32"
     )
     parser.add_argument('-d', '--device', default=None,
                         help='Dispositivo de teclado (ej: /dev/input/event3)')
+    parser.add_argument('-m', '--mouse', default=None,
+                        help='Dispositivo de raton (ej: /dev/input/event4)')
+    parser.add_argument('--no-mouse', action='store_true',
+                        help='No usar raton (solo teclado)')
+    parser.add_argument('--mouse-scale', type=float, default=1.0,
+                        help='Sensibilidad del raton (multiplicador de los deltas, 1.0=normal)')
     parser.add_argument('-s', '--serial', default=None,
                         help='Puerto serial del ESP32 (ej: /dev/ttyACM0)')
     parser.add_argument('-b', '--baudrate', type=int, default=115200,
@@ -375,6 +508,10 @@ def main():
         print("No se encontro el puerto serial del ESP32, especifica con --serial")
         return
 
+    mouse_path = None
+    if not args.no_mouse:
+        mouse_path = args.mouse or detectar_raton()
+
     try:
         toggle_codes, toggle_desc = parse_combo(args.toggle)
     except ValueError as e:
@@ -388,6 +525,8 @@ def main():
         grab=args.grab,
         toggle_codes=toggle_codes,
         toggle_desc=toggle_desc,
+        mouse_path=mouse_path,
+        mouse_scale=args.mouse_scale,
     )
 
     if bridge.connect():
