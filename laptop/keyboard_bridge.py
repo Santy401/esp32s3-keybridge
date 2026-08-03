@@ -138,7 +138,6 @@ class KeyboardBridge:
         self._dx = 0
         self._dy = 0
         self._wheel = 0
-        self._pan = 0
 
     def connect(self):
         try:
@@ -284,8 +283,6 @@ class KeyboardBridge:
                 self._dy += int(round(event.value * self.mouse_scale))
             elif event.code == ecodes.REL_WHEEL:
                 self._wheel = _clamp(self._wheel + event.value, -127, 127)
-            elif event.code == ecodes.REL_HWHEEL:
-                self._pan = _clamp(self._pan + event.value, -127, 127)
             return
 
         if event.type == ecodes.EV_KEY:
@@ -305,12 +302,10 @@ class KeyboardBridge:
             self._dy -= dy
             if not self.forwarding:
                 self._wheel = 0
-                self._pan = 0
                 return
-            if dx or dy or self._wheel or self._pan:
-                self.enviar_evento(0x02, dx, dy, self._wheel, self._pan)
+            if dx or dy or self._wheel:
+                self.enviar_evento(0x02, dx, dy, self._wheel)
             self._wheel = 0
-            self._pan = 0
 
     def run(self):
         if not self.device or not self.ser:
@@ -362,16 +357,22 @@ class KeyboardBridge:
 
 
 def detectar_puerto_serial():
-    """Detecta el puerto serial del ESP32 (CH340/CP210x/Espressif)."""
+    """Detecta el puerto serial del ESP32 (prefiere el puente UART tipo CH340/CP210x)."""
     from serial.tools import list_ports
+    found = []
     for port in list_ports.comports():
-        vid = None
-        if port.vid is not None:
-            vid = int(port.vid)
+        if port.vid is None:
+            continue
+        vid = int(port.vid)
         if vid in ESP32_SERIAL_VIDS:
-            print(f"Puerto serial detectado: {port.device} ({port.description})")
-            return port.device
-    return None
+            found.append((port, vid))
+    if not found:
+        return None
+    # Preferir el puente USB->UART (CH340/CP210x) sobre el USB nativo del ESP32
+    found.sort(key=lambda pv: 1 if pv[1] == 0x303A else 0)
+    port, vid = found[0]
+    print(f"Puerto serial detectado: {port.device} ({port.description})")
+    return port.device
 
 
 def detectar_teclado():
